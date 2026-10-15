@@ -30,6 +30,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import java.util.*
 import java.net.URL
@@ -65,7 +66,8 @@ data class TTSMessageEvent(
 @InvokeArg
 class SpeakArgs(
     val text: String? = "",
-    val preload: Boolean? = false
+    val queue: Boolean? = false,
+    val silenceMs: Long? = 0L
 )
 
 @InvokeArg
@@ -150,6 +152,9 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
     private var isSpeaking = AtomicBoolean(false)
     private var currentRate = AtomicReference<Float>(1.0f)
     private var currentPitch = AtomicReference<Float>(1.0f)
+    // Bumped by every stop: a speak issued before it must not reach the engine
+    // after it, or a sentence queued ahead would play on past the stop.
+    private val stopEpoch = AtomicInteger(0)
 
     // Continuous local-file playback for EPUB Media Overlays and paired
     // audiobooks. The WebView cannot expose Android app-private files as a
@@ -286,6 +291,7 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
         }
 
         val utteranceId = UUID.randomUUID().toString()
+        val epoch = stopEpoch.get()
 
         coroutineScope.launch {
             try {
@@ -303,7 +309,9 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
                 eventChannels[utteranceId] = eventChannel
 
                 val speakJob = launch {
-                    speakText(text, utteranceId, args.preload ?: false)
+                    if (epoch == stopEpoch.get()) {
+                        speakText(text, utteranceId, args.queue ?: false, args.silenceMs ?: 0L)
+                    }
                 }
                 speakingJobs[utteranceId] = speakJob
 
@@ -322,7 +330,7 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
     
-    private suspend fun speakText(text: String, utteranceId: String, preload: Boolean) {
+    private suspend fun speakText(text: String, utteranceId: String, queue: Boolean, silenceMs: Long) {
         withContext(Dispatchers.Main) {
             try {
                 textToSpeech?.apply {
@@ -333,10 +341,16 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
                 val params = Bundle().apply {
                     putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, utteranceId)
                 }
-                
+
+                // The paragraph gap, played by the engine between two queued
+                // utterances. Its events have no channel and are dropped.
+                if (silenceMs > 0) {
+                    textToSpeech?.playSilentUtterance(silenceMs, TextToSpeech.QUEUE_ADD, "$utteranceId-gap")
+                }
+
                 val result = textToSpeech?.speak(
                     text,
-                    if (preload) TextToSpeech.QUEUE_ADD else TextToSpeech.QUEUE_FLUSH,
+                    if (queue || silenceMs > 0) TextToSpeech.QUEUE_ADD else TextToSpeech.QUEUE_FLUSH,
                     params,
                     utteranceId
                 )
@@ -386,6 +400,7 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
     
     @Command
     fun pause(invoke: Invoke) {
+        stopEpoch.incrementAndGet()
         try {
             if (textToSpeech?.stop() == TextToSpeech.SUCCESS) {
                 isPaused.set(true)
@@ -412,6 +427,7 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
     
     @Command
     fun stop(invoke: Invoke) {
+        stopEpoch.incrementAndGet()
         try {
             if (textToSpeech?.stop() == TextToSpeech.SUCCESS) {
                 isSpeaking.set(false)

@@ -1,17 +1,31 @@
 import { invoke } from '@tauri-apps/api/core';
 import { addPluginListener, PluginListener } from '@tauri-apps/api/core';
-import { getUserLocale } from '@/utils/misc';
+import { getOSPlatform, getUserLocale } from '@/utils/misc';
 import { isSameLang } from '@/utils/lang';
 import { parseSSMLMarks } from '@/utils/ssml';
 import { stubTranslation as _ } from '@/utils/misc';
 import { TTSCapabilities, TTSClient, TTSMessageEvent } from './TTSClient';
 import { TTSGranularity, TTSMark, TTSVoice, TTSVoicesGroup } from './types';
 import { TTSUtils } from './TTSUtils';
-import { TTSController } from './TTSController';
+import { DEFAULT_PARAGRAPH_GAP_SEC, TTSController } from './TTSController';
 
 type TTSEventPayload = {
   utteranceId: string;
 } & TTSMessageEvent;
+
+// A sentence of the Android queue, in reading order. `id` is set once it has
+// been handed to the engine and resolves to its utterance id (null when a stop
+// or flush overtook it).
+type QueuedMark = {
+  mark: TTSMark;
+  silenceMs: number;
+  voiceId?: string;
+  id?: Promise<string | null>;
+};
+
+// Utterances the Android engine holds at once: the one playing and the next,
+// which the engine synthesizes while the first plays.
+const QUEUE_DEPTH = 2;
 
 const TTSEngines = {
   default: 'System TTS',
@@ -47,6 +61,23 @@ export class NativeTTSClient implements TTSClient {
   #currentVoiceId = '';
   #rate = 1.0;
   #pitch = 1.0;
+  #paragraphGapSec = DEFAULT_PARAGRAPH_GAP_SEC;
+
+  // Android keeps the next sentence queued in the engine (QUEUE_ADD) while one
+  // plays, across paragraph boundaries too, so a slow on-device engine
+  // synthesizes it during playback rather than in a pause after it. The
+  // paragraph after the current one comes from the controller's preloads.
+  // iOS speaks one sentence at a time as before.
+  #queueAhead = getOSPlatform() === 'android';
+  #queue: QueuedMark[] = [];
+  #upcoming: string[] = [];
+  #currentSsml: string | null = null;
+  #plannedSsml: string | null = null;
+  #endedNaturally = false;
+  #inFlight = new Set<string>();
+  #submitting = 0;
+  #generation = 0;
+  #submitChain: Promise<unknown> = Promise.resolve();
 
   #eventListener: PluginListener | null = null;
   #activeUtterances = new Map<
@@ -70,6 +101,10 @@ export class NativeTTSClient implements TTSClient {
         'tts_events',
         (event) => {
           const { utteranceId, code, message, mark } = event;
+
+          if ((code === 'end' || code === 'error') && this.#inFlight.delete(utteranceId)) {
+            this.#fillAhead();
+          }
 
           const utteranceData = this.#activeUtterances.get(utteranceId);
           if (!utteranceData) return;
@@ -101,11 +136,15 @@ export class NativeTTSClient implements TTSClient {
     return this.initialized;
   }
 
-  async *speakMark(mark: TTSMark, preload: boolean, signal: AbortSignal) {
-    if (preload) {
-      yield { code: 'end', message: 'Dummy preload finished' } as TTSMessageEvent;
-      return;
-    }
+  #track(utteranceId: string) {
+    this.#activeUtterances.set(utteranceId, {
+      eventQueue: [],
+      resolver: null,
+      finished: false,
+    });
+  }
+
+  async *speakMark(mark: TTSMark, signal: AbortSignal) {
     const { language: voiceLang } = mark;
     const voiceId = await this.getVoiceIdFromLang(voiceLang);
     this.#currentVoiceId = voiceId;
@@ -113,83 +152,202 @@ export class NativeTTSClient implements TTSClient {
     await this.setVoice(voiceId);
     try {
       const result = await invoke<{ utteranceId: string }>('plugin:native-tts|speak', {
-        payload: { text: mark.text, preload },
+        payload: { text: mark.text },
       });
-
-      const utteranceId = result.utteranceId;
-      this.#activeUtterances.set(utteranceId, {
-        eventQueue: [],
-        resolver: null,
-        finished: false,
-      });
-
-      const abortHandler = () => {
-        const utteranceData = this.#activeUtterances.get(utteranceId);
-        if (utteranceData && utteranceData.resolver) {
-          const error = { code: 'error', message: 'Aborted' } as TTSMessageEvent;
-          utteranceData.resolver({ value: error, done: true });
-          utteranceData.resolver = null;
-        }
-        this.stop();
-      };
-
-      signal.addEventListener('abort', abortHandler);
-
-      try {
-        while (true) {
-          const utteranceData = this.#activeUtterances.get(utteranceId);
-          if (!utteranceData) break;
-
-          if (utteranceData.eventQueue.length > 0) {
-            const event = utteranceData.eventQueue.shift()!;
-            event.mark = mark.name;
-            yield event;
-
-            if (event.code === 'end' || event.code === 'error') {
-              break;
-            }
-          } else if (utteranceData.finished) {
-            break;
-          } else {
-            const eventPromise = new Promise<TTSMessageEvent | void>((resolve) => {
-              const utteranceData = this.#activeUtterances.get(utteranceId);
-              if (!utteranceData) return resolve();
-              utteranceData.resolver = (res) =>
-                resolve(res.value?.code === 'error' ? res.value : undefined);
-            });
-            const timeoutPromise = new Promise<null>((resolve) =>
-              setTimeout(() => resolve(null), 100),
-            );
-            const result = await Promise.race([eventPromise, timeoutPromise]);
-            if (result) yield result;
-          }
-
-          if (signal.aborted) {
-            break;
-          }
-        }
-      } finally {
-        signal.removeEventListener('abort', abortHandler);
-        this.#activeUtterances.delete(utteranceId);
-      }
+      this.#track(result.utteranceId);
+      yield* this.#utteranceEvents(result.utteranceId, mark, signal);
     } catch (error) {
       console.error('Failed to speak:', error);
       throw error;
     }
   }
 
+  async *#utteranceEvents(utteranceId: string, mark: TTSMark, signal: AbortSignal) {
+    const abortHandler = () => {
+      const utteranceData = this.#activeUtterances.get(utteranceId);
+      if (utteranceData && utteranceData.resolver) {
+        const error = { code: 'error', message: 'Aborted' } as TTSMessageEvent;
+        utteranceData.resolver({ value: error, done: true });
+        utteranceData.resolver = null;
+      }
+      this.stop();
+    };
+
+    signal.addEventListener('abort', abortHandler);
+
+    try {
+      while (true) {
+        const utteranceData = this.#activeUtterances.get(utteranceId);
+        if (!utteranceData) break;
+
+        if (utteranceData.eventQueue.length > 0) {
+          const event = utteranceData.eventQueue.shift()!;
+          event.mark = mark.name;
+          yield event;
+
+          if (event.code === 'end' || event.code === 'error') {
+            break;
+          }
+        } else if (utteranceData.finished) {
+          break;
+        } else {
+          const eventPromise = new Promise<TTSMessageEvent | void>((resolve) => {
+            const utteranceData = this.#activeUtterances.get(utteranceId);
+            if (!utteranceData) return resolve();
+            utteranceData.resolver = (res) =>
+              resolve(res.value?.code === 'error' ? res.value : undefined);
+          });
+          const timeoutPromise = new Promise<null>((resolve) =>
+            setTimeout(() => resolve(null), 100),
+          );
+          const result = await Promise.race([eventPromise, timeoutPromise]);
+          if (result) yield result;
+        }
+
+        if (signal.aborted) {
+          break;
+        }
+      }
+    } finally {
+      signal.removeEventListener('abort', abortHandler);
+      this.#activeUtterances.delete(utteranceId);
+    }
+  }
+
+  // Hand a sentence to the engine. Submissions run one after another so each
+  // voice switch lands before its own speak; a stop or flush in the meantime
+  // (a new generation) drops the ones not yet sent.
+  #submit(entry: QueuedMark, queue: boolean) {
+    const generation = this.#generation;
+    this.#submitting++;
+    const id = this.#submitChain.then(async () => {
+      try {
+        if (generation !== this.#generation) return null;
+        entry.voiceId = await this.getVoiceIdFromLang(entry.mark.language);
+        await this.setVoice(entry.voiceId);
+        if (generation !== this.#generation) return null;
+        const { utteranceId } = await invoke<{ utteranceId: string }>('plugin:native-tts|speak', {
+          payload: { text: entry.mark.text, queue, silenceMs: entry.silenceMs },
+        });
+        if (generation !== this.#generation) return null;
+        this.#track(utteranceId);
+        this.#inFlight.add(utteranceId);
+        return utteranceId;
+      } finally {
+        if (generation === this.#generation) this.#submitting--;
+      }
+    });
+    this.#submitChain = id.catch(() => {});
+    entry.id = id;
+  }
+
+  // Keep the engine one sentence ahead of the one playing. Past the current
+  // paragraph, the next preloaded one is queued behind it, after a silence of
+  // the paragraph gap. Never while a step mode has to stop after a sentence.
+  #fillAhead() {
+    if (this.controller?.stepsBySentence()) return;
+    while (this.#inFlight.size + this.#submitting < QUEUE_DEPTH) {
+      const next = this.#queue.find((entry) => !entry.id);
+      if (next) {
+        this.#submit(next, true);
+        continue;
+      }
+      if (this.#currentSsml === null || this.#plannedSsml !== null) return;
+      const ssml = this.#upcoming.shift();
+      if (!ssml) return;
+      const { marks } = parseSSMLMarks(ssml, this.#primaryLang);
+      if (marks.length === 0) continue;
+      this.#plannedSsml = ssml;
+      const gapMs = Math.round(this.#paragraphGapSec * 1000);
+      this.#queue.push(...marks.map((mark, i) => ({ mark, silenceMs: i === 0 ? gapMs : 0 })));
+    }
+  }
+
+  #resetQueue(clearUpcoming: boolean) {
+    this.#generation++;
+    for (const id of this.#inFlight) this.#activeUtterances.delete(id);
+    this.#inFlight.clear();
+    this.#submitting = 0;
+    this.#queue = [];
+    this.#currentSsml = null;
+    this.#plannedSsml = null;
+    this.#endedNaturally = false;
+    if (clearUpcoming) this.#upcoming = [];
+  }
+
+  async *#speakQueued(ssml: string, marks: TTSMark[], signal: AbortSignal) {
+    const consumed = this.#upcoming.indexOf(ssml);
+    if (consumed >= 0) this.#upcoming.splice(0, consumed + 1);
+
+    // The paragraph queued behind the last one is already in the engine,
+    // likely already playing: carry on with it instead of starting over.
+    const head = this.#queue[0];
+    const adopt =
+      ssml === this.#plannedSsml &&
+      head?.mark.text === marks[0]?.text &&
+      (!head?.voiceId || head.voiceId === (await this.getVoiceIdFromLang(marks[0]!.language)));
+    if (!adopt) {
+      this.#resetQueue(false);
+      this.#queue = marks.map((mark) => ({ mark, silenceMs: 0 }));
+      // QUEUE_FLUSH: drops whatever the engine still holds.
+      if (this.#queue[0]) this.#submit(this.#queue[0], false);
+    }
+    this.#currentSsml = ssml;
+    this.#plannedSsml = null;
+    this.#endedNaturally = false;
+
+    for (const [i, mark] of marks.entries()) {
+      if (signal.aborted) return;
+      const entry = this.#queue.shift();
+      if (!entry) return;
+      if (!entry.id) this.#submit(entry, true);
+      this.controller?.dispatchSpeakMark(mark);
+      this.#fillAhead();
+      const utteranceId = await entry.id;
+      if (!utteranceId) return;
+      this.#speakingLang = mark.language;
+      this.#currentVoiceId = entry.voiceId ?? this.#currentVoiceId;
+      let lastCode: string | undefined;
+      for await (const ev of this.#utteranceEvents(utteranceId, mark, signal)) {
+        lastCode = ev.code;
+        yield ev;
+      }
+      if (i === marks.length - 1 && lastCode === 'end') this.#endedNaturally = true;
+    }
+  }
+
   async *speak(ssml: string, signal: AbortSignal, preload: boolean = false) {
     const { marks } = parseSSMLMarks(ssml, this.#primaryLang);
 
-    for (const mark of marks) {
-      if (!preload) this.controller?.dispatchSpeakMark(mark);
-      for await (const ev of this.speakMark(mark, preload, signal)) {
-        if (signal.aborted) {
-          yield { code: 'error', message: 'Aborted' } as TTSMessageEvent;
-          return;
-        }
-        yield ev;
+    if (preload) {
+      // Remembered in reading order: the paragraph after the current one is
+      // queued behind its last sentence.
+      if (this.#queueAhead && ssml !== this.#plannedSsml && !this.#upcoming.includes(ssml)) {
+        this.#upcoming.push(ssml);
+        this.#fillAhead();
       }
+      for (const _ of marks) {
+        yield { code: 'end', message: 'Dummy preload finished' } as TTSMessageEvent;
+      }
+      return;
+    }
+
+    const events = this.#queueAhead
+      ? this.#speakQueued(ssml, marks, signal)
+      : this.#speakEach(marks, signal);
+    for await (const ev of events) {
+      if (signal.aborted) {
+        yield { code: 'error', message: 'Aborted' } as TTSMessageEvent;
+        return;
+      }
+      yield ev;
+    }
+  }
+
+  async *#speakEach(marks: TTSMark[], signal: AbortSignal) {
+    for (const mark of marks) {
+      this.controller?.dispatchSpeakMark(mark);
+      yield* this.speakMark(mark, signal);
     }
   }
 
@@ -203,6 +361,8 @@ export class NativeTTSClient implements TTSClient {
   }
 
   async pause() {
+    // A native pause is a stop: the engine drops whatever was queued.
+    this.#resetQueue(false);
     await invoke('plugin:native-tts|pause');
     return false;
   }
@@ -213,7 +373,11 @@ export class NativeTTSClient implements TTSClient {
     return false;
   }
 
-  async stop() {
+  async stop(handover = false) {
+    // Handing over to the paragraph already queued behind the one that just
+    // ended: keep the engine playing it.
+    if (handover && this.#endedNaturally && this.#plannedSsml !== null) return;
+    this.#resetQueue(!handover);
     // Bound the native stop so teardown (controller.stop / shutdown, and thus
     // the TTS icon turning off) can never hang if the native side is slow to
     // resolve — e.g. iOS AVSpeechSynthesizer / audio-session teardown. See #4676.
@@ -306,6 +470,10 @@ export class NativeTTSClient implements TTSClient {
         if (b.id === 'default') return 1;
         return a.id.localeCompare(b.id);
       });
+  }
+
+  setParagraphGap(sec: number) {
+    this.#paragraphGapSec = sec;
   }
 
   setPrimaryLang(lang: string) {

@@ -277,7 +277,7 @@ export class TTSController extends EventTarget {
   // Supplied by the reader (setCustomTTSServices) so the controller stays free
   // of store imports.
   #customTTSServices: () => CustomTTSService[] = () => [];
-  ttsNativeClient: TTSClient | null = null;
+  ttsNativeClient: NativeTTSClient | null = null;
   ttsMediaOverlayClient: MediaOverlayClient;
   ttsWebVoices: TTSVoice[] = [];
   ttsEdgeVoices: TTSVoice[] = [];
@@ -1273,6 +1273,8 @@ export class TTSController extends EventTarget {
     this.ttsEdgeClient.setParagraphGap(sec);
     this.ttsReadestClient.setParagraphGap(sec);
     this.ttsCustomClient.setParagraphGap(sec);
+    // The native client queues it as silence before the next paragraph.
+    this.ttsNativeClient?.setParagraphGap(sec);
   }
 
   // Abortable delay inserted before auto-advancing to the next paragraph.
@@ -1806,7 +1808,7 @@ export class TTSController extends EventTarget {
         const { plainText, marks } = parseSSMLMarks(ssml);
         // A step mode speaks one sentence per utterance, so the engine stops
         // exactly where the sentence does.
-        const stepped = !oneTime && this.#stepsBySentence();
+        const stepped = !oneTime && this.stepsBySentence();
         if (!oneTime) {
           if (!plainText || marks.length === 0) {
             resolve();
@@ -1940,7 +1942,7 @@ export class TTSController extends EventTarget {
     await this.#currentSpeakPromise.catch((e) => this.error(e));
   }
 
-  #stepsBySentence(): boolean {
+  stepsBySentence(): boolean {
     return (this.pauseAfterSentence || this.#loopB !== null) && !this.usesAudioTransport();
   }
 

@@ -11,7 +11,6 @@ private let keepAliveLog = Logger(subsystem: "com.bilingify.readest", category: 
 
 class SpeakArgs: Decodable {
   let text: String?
-  let preload: Bool?
 }
 
 class SetRateArgs: Decodable {

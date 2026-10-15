@@ -28,8 +28,13 @@ pub struct InitResponse {
 #[serde(rename_all = "camelCase")]
 pub struct SpeakArgs {
     pub text: String,
+    // Add behind what the engine holds (Android QUEUE_ADD) instead of
+    // replacing it.
     #[serde(default)]
-    pub preload: bool,
+    pub queue: bool,
+    // Silence to play before the text, when queued after another utterance.
+    #[serde(default)]
+    pub silence_ms: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
