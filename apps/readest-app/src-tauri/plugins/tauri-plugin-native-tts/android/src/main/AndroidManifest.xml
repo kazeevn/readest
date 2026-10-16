@@ -4,5 +4,7 @@
     <intent>
       <action android:name="android.intent.action.TTS_SERVICE" />
     </intent>
+    <!-- Kokoro TTS direct synthesis (KokoroClient) -->
+    <provider android:authorities="io.github.kazeevn.kokorotts.synthesis" />
   </queries>
 </manifest>

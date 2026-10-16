@@ -10,6 +10,7 @@ import android.provider.Settings
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.speech.tts.Voice
+import android.util.Base64
 import android.util.Log
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -119,6 +120,18 @@ class SetMediaSessionActiveArgs {
   var bookHash: String? = null
   var bookTitle: String? = null
   var bookAuthor: String? = null
+}
+
+@InvokeArg
+class KokoroSynthesizeArgs {
+    var id: String? = null
+    var text: String? = null
+    var voice: String? = null
+}
+
+@InvokeArg
+class KokoroCancelArgs {
+    var id: String? = null
 }
 
 @InvokeArg
@@ -532,6 +545,50 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
+    // Kokoro TTS, synthesized ahead through its content provider and played by
+    // the web audio pipeline (see KokoroClient). No Rust commands: invoked as
+    // plugin:native-tts|kokoro_*, which reach these camelCased methods.
+    private val kokoro = KokoroClient(activity.applicationContext)
+    @Volatile private var kokoroSampleRate = 24000
+
+    @Command
+    fun kokoroVoices(invoke: Invoke) {
+        coroutineScope.launch(Dispatchers.IO) {
+            val voices = kokoro.voices()
+            if (voices != null) kokoroSampleRate = voices.sampleRate
+            invoke.resolve(JSObject().apply {
+                put("voices", JSONArray(voices?.ids ?: emptyList<String>()))
+                put("defaultVoice", voices?.defaultVoice ?: "")
+            })
+        }
+    }
+
+    @Command
+    fun kokoroSynthesize(invoke: Invoke) {
+        val args = invoke.parseArgs(KokoroSynthesizeArgs::class.java)
+        coroutineScope.launch(Dispatchers.IO) {
+            try {
+                val speech = kokoro.synthesize(args.id ?: "", args.text ?: "", args.voice ?: "", kokoroSampleRate)
+                invoke.resolve(JSObject().apply {
+                    put("audio", Base64.encodeToString(speech.wav, Base64.NO_WRAP))
+                    put("words", speech.words)
+                })
+            } catch (e: Exception) {
+                Log.w(TAG, "Kokoro synthesis failed", e)
+                invoke.reject(e.message ?: "Kokoro synthesis failed")
+            }
+        }
+    }
+
+    @Command
+    fun kokoroCancel(invoke: Invoke) {
+        val args = invoke.parseArgs(KokoroCancelArgs::class.java)
+        coroutineScope.launch(Dispatchers.IO) {
+            args.id?.let { kokoro.cancel(it) }
+            invoke.resolve()
+        }
+    }
+
     private suspend fun loadArtworkFromUrl(urlString: String): Bitmap? {
         return withContext(Dispatchers.IO) {
             try {
@@ -804,6 +861,8 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
             speakingJobs.clear()
             eventChannels.clear()
 
+            kokoro.release()
+
             Log.d(TAG, "TTS engine shut down due to idle timeout")
         } catch (e: Exception) {
             Log.e(TAG, "Error during idle TTS shutdown", e)
@@ -827,6 +886,7 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
             speakingJobs.clear()
             playoutPlayer?.release()
             playoutPlayer = null
+            kokoro.release()
 
             Log.d(TAG, "Plugin destroyed successfully")
         } catch (e: Exception) {

@@ -26,6 +26,7 @@ import { createBookTTSCacheStore } from './providers/bookCacheStore';
 import { CachingProvider } from './providers/cache';
 import { ReadestVoiceProvider } from './providers/readest';
 import { OpenAICompatibleSpeechProvider } from './providers/openaiCompatible';
+import { KokoroSpeechProvider } from './providers/kokoro';
 import type { CustomTTSService } from '@/types/customTTS';
 import { getAccessToken, isCustomTTSAllowed } from '@/utils/access';
 import { SectionTimeline, TimelineSentence } from './SectionTimeline';
@@ -278,12 +279,17 @@ export class TTSController extends EventTarget {
   // of store imports.
   #customTTSServices: () => CustomTTSService[] = () => [];
   ttsNativeClient: NativeTTSClient | null = null;
+  // Kokoro TTS on the device (Android, when the Kokoro app is installed),
+  // synthesized ahead through its content provider: like custom services,
+  // never the default engine, only chosen by picking one of its voices.
+  ttsKokoroClient: BufferedTTSClient | null = null;
   ttsMediaOverlayClient: MediaOverlayClient;
   ttsWebVoices: TTSVoice[] = [];
   ttsEdgeVoices: TTSVoice[] = [];
   ttsReadestVoices: TTSVoice[] = [];
   ttsCustomVoices: TTSVoice[] = [];
   ttsNativeVoices: TTSVoice[] = [];
+  ttsKokoroVoices: TTSVoice[] = [];
   ttsTargetLang: string = '';
 
   options: TTSHighlightOptions = { style: 'highlight', color: 'gray' };
@@ -324,6 +330,9 @@ export class TTSController extends EventTarget {
     // TODO: implement native TTS client for desktop platforms.
     if (appService?.isAndroidApp || appService?.isIOSApp) {
       this.ttsNativeClient = new NativeTTSClient(this);
+    }
+    if (appService?.isAndroidApp) {
+      this.ttsKokoroClient = new BufferedTTSClient(new KokoroSpeechProvider(), this, appService);
     }
     this.ttsMediaOverlayClient = new MediaOverlayClient(this);
     this.ttsClient = this.ttsWebClient;
@@ -515,6 +524,9 @@ export class TTSController extends EventTarget {
       ? withinEngineTimeout(this.ttsNativeClient.init(), false)
       : undefined;
     const webReady = withinEngineTimeout(this.ttsWebClient.init(), false);
+    const kokoroReady = this.ttsKokoroClient
+      ? withinEngineTimeout(this.ttsKokoroClient.init(), false)
+      : undefined;
     if (await edgeReady) {
       availableClients.push(this.ttsEdgeClient);
     }
@@ -533,6 +545,10 @@ export class TTSController extends EventTarget {
     const customOk = await customReady;
     if (customOk) {
       availableClients.push(this.ttsCustomClient);
+    }
+    if (this.ttsKokoroClient && (await kokoroReady)) {
+      availableClients.push(this.ttsKokoroClient);
+      this.ttsKokoroVoices = await this.ttsKokoroClient.getAllVoices();
     }
     this.ttsClient = availableClients[0] || this.ttsWebClient;
     const preferredClientName = TTSUtils.getPreferredClient();
@@ -1261,6 +1277,7 @@ export class TTSController extends EventTarget {
     this.ttsEdgeClient.setSentenceGap(sec);
     this.ttsReadestClient.setSentenceGap(sec);
     this.ttsCustomClient.setSentenceGap(sec);
+    this.ttsKokoroClient?.setSentenceGap(sec);
   }
 
   // Universal (not Edge-only) paragraph-to-paragraph gap, in wall-clock
@@ -1273,6 +1290,7 @@ export class TTSController extends EventTarget {
     this.ttsEdgeClient.setParagraphGap(sec);
     this.ttsReadestClient.setParagraphGap(sec);
     this.ttsCustomClient.setParagraphGap(sec);
+    this.ttsKokoroClient?.setParagraphGap(sec);
     // The native client queues it as silence before the next paragraph.
     this.ttsNativeClient?.setParagraphGap(sec);
   }
@@ -2227,7 +2245,8 @@ export class TTSController extends EventTarget {
       );
     if (
       (this.ttsClient === this.ttsReadestClient && !speaks(this.ttsReadestVoices)) ||
-      (this.ttsClient === this.ttsCustomClient && !speaks(this.ttsCustomVoices))
+      (this.ttsClient === this.ttsCustomClient && !speaks(this.ttsCustomVoices)) ||
+      (this.ttsClient === this.ttsKokoroClient && !speaks(this.ttsKokoroVoices))
     ) {
       this.ttsClient = this.ttsEdgeClient.initialized ? this.ttsEdgeClient : this.ttsWebClient;
     }
@@ -2240,6 +2259,7 @@ export class TTSController extends EventTarget {
     if (this.ttsCustomClient.initialized) this.ttsCustomClient.setPrimaryLang(lang);
     if (this.ttsWebClient.initialized) this.ttsWebClient.setPrimaryLang(lang);
     if (this.ttsNativeClient?.initialized) this.ttsNativeClient?.setPrimaryLang(lang);
+    if (this.ttsKokoroClient?.initialized) this.ttsKokoroClient.setPrimaryLang(lang);
     if (this.ttsMediaOverlayClient.initialized) this.ttsMediaOverlayClient.setPrimaryLang(lang);
   }
 
@@ -2276,9 +2296,13 @@ export class TTSController extends EventTarget {
     const ttsCustomVoices = this.ttsCustomClient.initialized
       ? (await this.ttsCustomClient.getVoices(lang)).filter((group) => group.voices.length > 0)
       : [];
+    const ttsKokoroVoices = this.ttsKokoroClient?.initialized
+      ? (await this.ttsKokoroClient.getVoices(lang)).filter((group) => group.voices.length > 0)
+      : [];
 
     const voicesGroups = [
       ...narrationVoices,
+      ...ttsKokoroVoices,
       ...ttsCustomVoices,
       ...ttsReadestVoices,
       ...ttsEdgeVoices,
@@ -2319,6 +2343,10 @@ export class TTSController extends EventTarget {
       voiceId !== '' &&
       this.ttsCustomClient.initialized &&
       this.ttsCustomVoices.some((voice) => voice.id === voiceId);
+    const useKokoroTTS =
+      voiceId !== '' &&
+      !!this.ttsKokoroClient?.initialized &&
+      this.ttsKokoroVoices.some((voice) => voice.id === voiceId);
     const useReadestTTS =
       voiceId !== '' &&
       this.ttsReadestClient.initialized &&
@@ -2329,7 +2357,10 @@ export class TTSController extends EventTarget {
     const useNativeTTS = !!this.ttsNativeVoices.find(
       (voice) => (voiceId === '' || voice.id === voiceId) && !voice.disabled,
     );
-    if (useCustomTTS) {
+    if (useKokoroTTS && this.ttsKokoroClient) {
+      this.ttsClient = this.ttsKokoroClient;
+      await this.ttsClient.setRate(this.ttsRate);
+    } else if (useCustomTTS) {
       this.ttsClient = this.ttsCustomClient;
       await this.ttsClient.setRate(this.ttsRate);
     } else if (useReadestTTS) {
@@ -2715,6 +2746,9 @@ export class TTSController extends EventTarget {
     }
     if (this.ttsNativeClient?.initialized) {
       await this.ttsNativeClient.shutdown();
+    }
+    if (this.ttsKokoroClient?.initialized) {
+      await this.ttsKokoroClient.shutdown();
     }
     if (this.ttsMediaOverlayClient.initialized) {
       await this.ttsMediaOverlayClient.shutdown();
